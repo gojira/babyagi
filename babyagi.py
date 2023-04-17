@@ -10,6 +10,33 @@ import openai
 import pinecone
 from dotenv import load_dotenv
 
+import sys
+
+class Tee:
+    def __init__(self, file_name):
+        self.file = open(file_name, 'a')
+        self.stdout = sys.stdout
+
+    def write(self, data):
+        self.file.write(data)
+        self.stdout.write(data)
+        self.flush()
+
+    def flush(self):
+        self.file.flush()
+        self.stdout.flush()
+
+    def close(self):
+        self.file.close()
+
+# Create a Tee object that writes to both the terminal and a file named "output.txt"
+tee = Tee('output.txt')
+
+# Redirect standard output to the Tee object
+sys.stdout = tee
+
+
+
 # Load default environment variables (.env)
 load_dotenv()
 
@@ -100,7 +127,7 @@ print(f"{OBJECTIVE}")
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
 
 # Configure OpenAI and Pinecone
-openai.api_key = OPENAI_API_KEY
+# openai.api_key = OPENAI_API_KEY
 pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 
 # Create Pinecone index
@@ -126,16 +153,18 @@ def add_task(task: Dict):
 
 def get_ada_embedding(text):
     text = text.replace("\n", " ")
-    return openai.Embedding.create(input=[text], model="text-embedding-ada-002")[
+    return openai.Embedding.create(input=[text], engine="text-embedding-ada-002")[
         "data"
     ][0]["embedding"]
+
+azure = "OPENAI_API_TYPE" in os.environ and os.environ["OPENAI_API_TYPE"] == "azure"
 
 
 def openai_call(
     prompt: str,
     model: str = OPENAI_API_MODEL,
     temperature: float = 0.5,
-    max_tokens: int = 100,
+    max_tokens: int = 512,
 ):
     while True:
         try:
@@ -159,14 +188,25 @@ def openai_call(
             else:
                 # Use chat completion API
                 messages = [{"role": "system", "content": prompt}]
-                response = openai.ChatCompletion.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    n=1,
-                    stop=None,
-                )
+                if azure:
+                    response = openai.ChatCompletion.create(
+                        engine=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        n=1,
+                        stop=None,
+                    )
+                else:
+                    response = openai.ChatCompletion.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=1,
+                        frequency_penalty=0,
+                        presence_penalty=0,
+                    )
                 return response.choices[0].message.content.strip()
         except openai.error.RateLimitError:
             print(
@@ -262,49 +302,63 @@ first_task = {"task_id": 1, "task_name": INITIAL_TASK}
 add_task(first_task)
 # Main loop
 task_id_counter = 1
-while True:
-    if task_list:
-        # Print the task list
-        print("\033[95m\033[1m" + "\n*****TASK LIST*****\n" + "\033[0m\033[0m")
-        for t in task_list:
-            print(str(t["task_id"]) + ": " + t["task_name"])
 
-        # Step 1: Pull the first task
-        task = task_list.popleft()
-        print("\033[92m\033[1m" + "\n*****NEXT TASK*****\n" + "\033[0m\033[0m")
-        print(str(task["task_id"]) + ": " + task["task_name"])
+try:
+    while True:
+        if task_list and task_id_counter < 30:
+            # Print the task list
+            print("\033[95m\033[1m" + "\n*****TASK LIST*****\n" + "\033[0m\033[0m")
+            for t in task_list:
+                print(str(t["task_id"]) + ": " + t["task_name"])
 
-        # Send to execution function to complete the task based on the context
-        result = execution_agent(OBJECTIVE, task["task_name"])
-        this_task_id = int(task["task_id"])
-        print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
-        print(result)
+            # Step 1: Pull the first task
+            task = task_list.popleft()
+            print("\033[92m\033[1m" + "\n*****NEXT TASK*****\n" + "\033[0m\033[0m")
+            print(str(task["task_id"]) + ": " + task["task_name"])
 
-        # Step 2: Enrich result and store in Pinecone
-        enriched_result = {
-            "data": result
-        }  # This is where you should enrich the result if needed
-        result_id = f"result_{task['task_id']}"
-        vector = get_ada_embedding(
-            enriched_result["data"]
-        )  # get vector of the actual result extracted from the dictionary
-        index.upsert(
-            [(result_id, vector, {"task": task["task_name"], "result": result})],
-	    namespace=OBJECTIVE
-        )
+            # Send to execution function to complete the task based on the context
+            result = execution_agent(OBJECTIVE, task["task_name"])
+            this_task_id = int(task["task_id"])
+            print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
+            print(result)
 
-        # Step 3: Create new tasks and reprioritize task list
-        new_tasks = task_creation_agent(
-            OBJECTIVE,
-            enriched_result,
-            task["task_name"],
-            [t["task_name"] for t in task_list],
-        )
+            # Step 2: Enrich result and store in Pinecone
+            enriched_result = {
+                "data": result
+            }  # This is where you should enrich the result if needed
+            result_id = f"result_{task['task_id']}"
+            vector = get_ada_embedding(
+                enriched_result["data"]
+            )  # get vector of the actual result extracted from the dictionary
+            index.upsert(
+                [(result_id, vector, {"task": task["task_name"], "result": result})],
+            namespace=OBJECTIVE
+            )
 
-        for new_task in new_tasks:
-            task_id_counter += 1
-            new_task.update({"task_id": task_id_counter})
-            add_task(new_task)
-        prioritization_agent(this_task_id)
+            # Step 3: Create new tasks and reprioritize task list
+            new_tasks = task_creation_agent(
+                OBJECTIVE,
+                enriched_result,
+                task["task_name"],
+                [t["task_name"] for t in task_list],
+            )
 
-    time.sleep(1)  # Sleep before checking the task list again
+            for new_task in new_tasks:
+                task_id_counter += 1
+                new_task.update({"task_id": task_id_counter})
+                add_task(new_task)
+            prioritization_agent(this_task_id)
+
+        time.sleep(1)  # Sleep before checking the task list again
+except KeyboardInterrupt:
+    # Handle the KeyboardInterrupt exception (Control+C)
+    print("\nInterrupted by user. Flushing output and exiting...", file=sys.stderr)
+    tee.flush()
+    tee.close()
+    sys.exit(1)
+
+# Reset standard output to the original stream
+sys.stdout = tee.stdout
+
+# Close the file
+tee.close()
